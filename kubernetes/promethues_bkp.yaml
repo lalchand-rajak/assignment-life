@@ -1,0 +1,138 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: monitoring
+  labels:
+    app: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      containers:
+      - name: prometheus
+        image: prom/prometheus:latest
+        args:
+          - "--config.file=/etc/prometheus/prometheus.yml"
+        ports:
+        - containerPort: 9090
+        volumeMounts:
+        - name: config-volume
+          mountPath: "/etc/prometheus"
+      volumes:
+      - name: config-volume
+        configMap:
+          name: prometheus-config
+---
+# apiVersion: v1
+# kind: ConfigMap
+# metadata:
+#   name: prometheus-config
+#   namespace: monitoring
+# data:
+#   prometheus.yml: |
+#     global:
+#       scrape_interval: 15s
+#       evaluation_interval: 15s
+#     scrape_configs:
+#       - job_name: 'prometheus'
+#         static_configs:
+#           - targets: ['localhost:9090']
+#     remote_write:
+#       - url: "http://grafana-mimir.monitoring.svc.cluster.local:9009/api/v1/push"
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+      evaluation_interval: 15s
+    scrape_configs:
+      # Prometheus self-monitoring
+      - job_name: 'prometheus'
+        static_configs:
+          - targets: ['localhost:9090']
+      - job_name: 'kubelet'
+        scheme: https
+        tls_config:
+          insecure_skip_verify: true  # 🔥 Ignore TLS verification 🔥
+        kubernetes_sd_configs:
+          - role: node
+        metrics_path: /metrics
+        relabel_configs:
+          - source_labels: [__address__]
+            target_label: instance
+      - job_name: 'postgres'
+        static_configs:
+          - targets: ['pg-exporter-service.monitor.svc.cluster.local:9187']
+      # Scrape metrics from demo-app
+      - job_name: 'demo-app'
+        static_configs:
+          - targets: ['demo-app-service.application.svc.cluster.local:3000']
+        metrics_path: /metrics
+
+      # Scrape Minikube node metrics via kubelet
+      - job_name: 'minikube-nodes'
+        scheme: https  # Minikube kubelet typically uses HTTPS
+        tls_config:
+          insecure_skip_verify: true  # Skip cert verification for Minikube
+        static_configs:
+          - targets: ['minikube:10250']  # Kubelet port in Minikube
+        metrics_path: /metrics
+        relabel_configs:
+          - source_labels: [__address__]
+            target_label: instance
+
+      # Scrape pod metrics using Kubernetes service discovery
+      - job_name: 'kubernetes-pods'
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          # Only scrape pods with a prometheus.io/scrape annotation set to "true"
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: true
+          # Use the port specified in prometheus.io/port annotation if present
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_port, __address__]
+            action: replace
+            regex: (.+);(.+)
+            replacement: $2:$1
+            target_label: __address__
+          # Drop if no metrics path is specified (optional)
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+            replacement: $1
+          - action: labelmap
+            regex: __meta_kubernetes_pod_label_(.+)
+          - source_labels: [__meta_kubernetes_namespace]
+            target_label: namespace
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+
+    remote_write:
+      - url: "http://grafana-mimir.monitoring.svc.cluster.local:9009/api/v1/push"
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: monitoring
+spec:
+  ports:
+  - port: 9090
+    targetPort: 9090
+  selector:
+    app: prometheus
